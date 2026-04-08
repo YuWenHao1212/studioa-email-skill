@@ -134,6 +134,35 @@ account: {帳號名稱}
 - HTML 場景要明確告訴學員「會跳對話框，請選 folder + 關視窗才存得進去」
 - 不要承諾「一鍵存草稿」這種話如果是 HTML 場景
 
+## 多帳號 dispatch（重要）
+
+`.env.email` 每個帳號都需要 `<NAME>_APPLE_SENDER` 欄位，格式為 `Full Name <email@example.com>`，必須跟 Apple Mail 帳號設定的 Full Name 和 Email Address 完全一致。
+
+範例 `.env.email`（雙帳號）：
+```
+ACCOUNTS=personal,training
+
+personal_PROVIDER=gmail
+personal_HOST=studioa.com.tw
+personal_PORT=143
+personal_USER=kat.chang
+personal_PASSWORD=...
+personal_APPLE_SENDER=Kat Chang <kat.chang@studioa.com.tw>
+
+training_PROVIDER=gmail
+training_HOST=studioa.com.tw
+training_PORT=143
+training_USER=training
+training_PASSWORD=...
+training_APPLE_SENDER=STUDIO A Training <training@studioa.com.tw>
+```
+
+**dispatch 邏輯**：
+- 純文字路徑（AppleScript）：把 `<NAME>_APPLE_SENDER` 帶進 `make new outgoing message` 的 `sender` 屬性 → 草稿直接存到對應帳號的本機草稿匣
+- HTML 路徑（.eml）：`From:` header 寫 `<NAME>_USER` → Apple Mail 開啟 .eml 時識別 From → Cmd+S 對話框會預設展開到對應帳號的草稿匣
+
+**對 Claude 的影響**：使用者說「幫我用 personal 寄信給 X」或「用 training 帳號發通知」時，把對應的 account_name 傳給 `email_ops.py draft <name> ...`。如果使用者沒指定帳號，要主動問「你要用哪個帳號寄」（不要預設用第一個）。
+
 ## HTML 信件規則
 
 產 HTML body 時**必須遵守**：

@@ -503,12 +503,17 @@ def _applescript_quote(s):
   return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "")
 
 
-def _save_via_applescript(to_addr, subject, body, cc=None):
+def _save_via_applescript(to_addr, subject, body, cc=None, sender=None):
   """Use AppleScript to create a draft directly in Apple Mail.
 
   This is the PLAIN-TEXT path. Apple Mail's `make new outgoing message` API
   creates a real draft state — Cmd+S saves directly into the local drafts
   mailbox without any "save as" dialog.
+
+  When `sender` is provided (format: "Full Name <email@example.com>"), the
+  draft is dispatched to that account's local drafts mailbox. The sender
+  string must match an account that Apple Mail already has configured. If
+  omitted, Apple Mail uses the default account.
 
   Limitation: Apple Mail's `content` property is plain text only. HTML markup
   will appear as raw tags. For HTML, use _save_via_eml() instead.
@@ -525,8 +530,18 @@ def _save_via_applescript(to_addr, subject, body, cc=None):
       )
   recipients_script = "\n    ".join(recipient_blocks)
 
+  # Build the properties block — include sender only if provided
+  props = [
+    f'subject:"{_applescript_quote(subject)}"',
+    f'content:"{_applescript_quote(body)}"',
+    "visible:true",
+  ]
+  if sender:
+    props.append(f'sender:"{_applescript_quote(sender)}"')
+  props_block = ", ".join(props)
+
   script = f'''tell application "Mail"
-  set newMessage to make new outgoing message with properties {{subject:"{_applescript_quote(subject)}", content:"{_applescript_quote(body)}", visible:true}}
+  set newMessage to make new outgoing message with properties {{{props_block}}}
   tell newMessage
     {recipients_script}
   end tell
@@ -588,6 +603,28 @@ def _load_user_address(account_name):
       for line in f:
         line = line.strip()
         if line.startswith(f"EMAIL_{account_name.upper()}_USER="):
+          return line.split("=", 1)[1].strip().strip('"').strip("'")
+  return ""
+
+
+def _load_apple_sender(account_name):
+  """Read EMAIL_<ACCOUNT>_APPLE_SENDER from .env.email.
+
+  Format: "Full Name <email@example.com>" — must match an account that Apple
+  Mail already has configured. Used by AppleScript dispatch to route plain-
+  text drafts to the correct account's local drafts mailbox.
+
+  Returns empty string if not configured (caller falls back to Apple Mail's
+  default account).
+  """
+  sender = os.environ.get(f"EMAIL_{account_name.upper()}_APPLE_SENDER", "")
+  if sender:
+    return sender
+  if os.path.exists(ENV_FILE):
+    with open(ENV_FILE) as f:
+      for line in f:
+        line = line.strip()
+        if line.startswith(f"EMAIL_{account_name.upper()}_APPLE_SENDER="):
           return line.split("=", 1)[1].strip().strip('"').strip("'")
   return ""
 
@@ -668,11 +705,13 @@ def cmd_draft(account_name, to_addr, subject, body, cc=None, html=False, theme=F
         "hint": "因為帶附件，走 .eml 路徑。要存草稿請按 Cmd+S → 選 folder → 關視窗。",
       }
     else:
-      mode, opened = _save_via_applescript(to_addr, subject, body, cc=cc)
+      sender = _load_apple_sender(account_name)
+      mode, opened = _save_via_applescript(to_addr, subject, body, cc=cc, sender=sender)
       output = {
         "mode": "plain-applescript",
         "opened_in_mail": opened,
         "account": account_name,
+        "sender": sender or "(default)",
         "to": to_addr,
         "subject": subject,
         "hint": "Apple Mail 已彈出新郵件視窗。按 Cmd+S 直接存進本機草稿匣（一鍵）。",
@@ -791,13 +830,17 @@ def cmd_reply(account_name, msg_id, body, reply_all=False, html=False, theme=Fal
         output["attachments"] = [os.path.basename(f) for f in attachments]
     else:
       # Plain text reply → AppleScript direct draft (one-click save)
+      sender = _load_apple_sender(account_name)
       mode, opened = _save_via_applescript(
-        reply_to_addr, reply_subject, body, cc=cc_addrs if cc_addrs else None
+        reply_to_addr, reply_subject, body,
+        cc=cc_addrs if cc_addrs else None,
+        sender=sender,
       )
       output = {
         "mode": "plain-applescript",
         "opened_in_mail": opened,
         "account": account_name,
+        "sender": sender or "(default)",
         "to": reply_to_addr,
         "cc": cc_addrs,
         "subject": reply_subject,
