@@ -161,7 +161,46 @@ training_APPLE_SENDER=STUDIO A Training <training@studioa.com.tw>
 - 純文字路徑（AppleScript）：把 `<NAME>_APPLE_SENDER` 帶進 `make new outgoing message` 的 `sender` 屬性 → 草稿直接存到對應帳號的本機草稿匣
 - HTML 路徑（.eml）：`From:` header 寫 `<NAME>_USER` → Apple Mail 開啟 .eml 時識別 From → Cmd+S 對話框會預設展開到對應帳號的草稿匣
 
-**對 Claude 的影響**：使用者說「幫我用 personal 寄信給 X」或「用 training 帳號發通知」時，把對應的 account_name 傳給 `email_ops.py draft <name> ...`。如果使用者沒指定帳號，要主動問「你要用哪個帳號寄」（不要預設用第一個）。
+**對 Claude 的影響**：使用者說「幫我用 personal 寄信給 X」或「用 training 帳號發通知」時，把對應的 account_name 傳給 `email_ops.py draft <name> ...`。
+
+## Sender 選擇邏輯（回信 / 寄信時怎麼決定用哪個帳號）
+
+當使用者有多個帳號時，**不要默默選 sender，也不要每次都空白問**。按以下順序判斷：
+
+### 1. 使用者明確指定
+
+使用者說「**用 personal 回**」「**用 training 帳號寫**」「**幫我用部門信箱回覆**」— 直接用指定的帳號，不用問。
+
+### 2. 回信情境（reply）
+
+使用者說「**回這封信**」「**幫我回覆**」「**對這封信寫回應**」時：
+
+1. 先看**原信是從哪個帳號讀到的**（看 recent / read / search 時用的 account_name，或看原信的收件人地址）
+2. **建議**用同一個帳號回，但**要跟使用者確認**
+3. 話術範例：
+   > 「這封信是從 **personal** 帳號讀到的，我建議用 personal 回。要用 personal 嗎，還是妳要改用 training？」
+
+**不要默默選**。即使 99% 的情況是「讀什麼就從什麼回」，還是要確認 — 因為反例很關鍵：
+- 個人信箱收到部門業務相關的信（講師寄錯地方）→ 應該用 training 回（代表部門立場）
+- 部門信箱收到個人推薦的諮詢 → 可能用 personal 回（建立個人關係）
+- 寄錯帳號會影響對外信譽、法律身分、信件 threading
+
+### 3. 新寫信情境（不是 reply）
+
+使用者說「**幫我寫一封信給 X**」「**幫我擬一封通知**」而沒指定帳號時：
+
+- **主動問**：「要用哪個帳號寄？personal 還是 training？」
+- **不要預設用第一個帳號**
+- 如果有明確語境線索可以推論（例如「幫我用我個人名義寫一封推薦信」），可以建議但仍要確認
+
+### 4. 為什麼這樣設計
+
+這套邏輯符合 **Human-in-the-loop (HITL)** 原則：
+- AI 有 context awareness（知道原信來自哪）
+- AI 提供 sane default（建議同一帳號回）
+- **但使用者永遠是最後決策點**（確認 sender）
+
+寄錯帳號的代價（對外信譽、法律身分、thread 斷掉）**遠高於問一句話的成本**。
 
 ## HTML 信件規則
 
