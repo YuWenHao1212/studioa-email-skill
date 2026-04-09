@@ -97,8 +97,12 @@ SANITIZE_ALLOWED_CSS_PROPERTIES = [
   'padding', 'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
   'margin', 'margin-top', 'margin-right', 'margin-bottom', 'margin-left',
   'width', 'height', 'min-width', 'max-width', 'min-height', 'max-height',
-  'display', 'visibility',
-  'list-style', 'list-style-type', 'list-style-position',
+  # Note: 'display' and 'visibility' intentionally excluded — they enable
+  # cloaked content attacks (hide "this is phishing" warnings from victim).
+  # Note: 'list-style' excluded because it accepts url() values which bleach's
+  # CSSSanitizer does not validate. Use list-style-type / list-style-position
+  # which only accept keyword values.
+  'list-style-type', 'list-style-position',
   'table-layout', 'caption-side',
   'direction',
 ]
@@ -293,8 +297,52 @@ def decode_addr(raw_header):
 MAX_ATTACH_SIZE = 25 * 1024 * 1024  # 25MB per file
 
 
-def attach_files(msg, file_paths):
-  """Attach files to a MIMEMultipart message."""
+def _is_path_in_allowlist(path):
+  """Check if an absolute path is under an allowed attachment root.
+
+  Allowed roots:
+    - ~/Downloads/
+    - ~/Desktop/
+    - ~/Documents/ai-workspace/
+    - /tmp/  (for scripted / programmatic attachments)
+
+  This is defence against prompt-injection attacks where a malicious
+  email tricks Claude into attaching ~/Documents/passwords.txt or
+  ~/.ssh/id_rsa to an outgoing draft. Users who legitimately need to
+  attach files from other locations can pass --allow-any-path or copy
+  the file into ~/Downloads/ first.
+
+  The path is resolved via realpath to collapse symlinks (e.g. /tmp →
+  /private/tmp on macOS) before comparison, so the caller can pass
+  either form.
+  """
+  resolved = os.path.realpath(path)
+  home = os.path.expanduser("~")
+  allowed_roots = [
+    os.path.realpath(os.path.join(home, "Downloads")),
+    os.path.realpath(os.path.join(home, "Desktop")),
+    os.path.realpath(os.path.join(home, "Documents", "ai-workspace")),
+    os.path.realpath("/tmp"),
+  ]
+  for root in allowed_roots:
+    # Use os.path.commonpath to handle trailing slashes correctly and
+    # prevent prefix-confusion (e.g. /home/user vs /home/user2).
+    try:
+      if os.path.commonpath([resolved, root]) == root:
+        return True
+    except ValueError:
+      # commonpath raises on mixed drives / relative paths — treat as not allowed
+      continue
+  return False
+
+
+def attach_files(msg, file_paths, allow_any_path=False):
+  """Attach files to a MIMEMultipart message.
+
+  By default, file_paths must resolve to a location under the attachment
+  allowlist (~/Downloads/, ~/Desktop/, ~/Documents/ai-workspace/, /tmp/).
+  Set allow_any_path=True to bypass (explicit user opt-in).
+  """
   for fpath in file_paths:
     resolved = os.path.realpath(fpath)
     # Block dotfiles and dot-directories (e.g. .ssh/, .env, .gnupg/)
@@ -302,6 +350,14 @@ def attach_files(msg, file_paths):
     has_dotfile = any(p.startswith(".") and p not in (".", "..") for p in path_parts if p)
     if has_dotfile:
       print(json.dumps({"error": f"Refused to attach dotfile/dotdir path: {fpath}"}), file=sys.stderr)
+      continue
+    # Path allowlist check — defence against prompt-injection exfiltration
+    if not allow_any_path and not _is_path_in_allowlist(resolved):
+      print(json.dumps({
+        "error": f"Refused to attach file outside allowlist: {fpath}",
+        "hint": "Allowed roots: ~/Downloads, ~/Desktop, ~/Documents/ai-workspace, /tmp. "
+                "Copy the file into one of those, or pass --allow-any-path to bypass.",
+      }), file=sys.stderr)
       continue
     if not os.path.exists(resolved):
       print(json.dumps({"warning": f"File not found: {fpath}"}), file=sys.stderr)
@@ -705,6 +761,21 @@ def _save_via_eml(msg, account_name):
   output_dir = Path.home() / "Documents" / "ai-workspace" / "output"
   output_dir.mkdir(parents=True, exist_ok=True)
 
+  # Opportunistic cleanup: delete .eml files older than 7 days. Keeps the
+  # output dir from growing unbounded and limits how long draft content
+  # lingers on disk. Only touches files this script created (draft-*.eml).
+  try:
+    import time
+    cutoff = time.time() - (7 * 86400)
+    for old in output_dir.glob("draft-*.eml"):
+      try:
+        if old.stat().st_mtime < cutoff:
+          old.unlink()
+      except OSError:
+        pass
+  except Exception:
+    pass  # cleanup is best-effort, never block draft creation
+
   ts = datetime.now().strftime("%Y%m%d-%H%M%S")
   filename = f"draft-{account_name}-{ts}.eml"
   eml_path = output_dir / filename
@@ -760,7 +831,7 @@ def _load_apple_sender(account_name):
   return ""
 
 
-def cmd_draft(account_name, to_addr, subject, body, cc=None, as_html=False, theme=False, attachments=None):
+def cmd_draft(account_name, to_addr, subject, body, cc=None, as_html=False, theme=False, attachments=None, allow_any_path=False):
   # Internal alias retained to avoid a large rename inside this function.
   # Callers of the NAME "html" inside this function get the local bool,
   # not the html module — the module is imported as `html_lib` precisely
@@ -793,7 +864,7 @@ def cmd_draft(account_name, to_addr, subject, body, cc=None, as_html=False, them
       msg = MIMEMultipart("mixed")
       msg.attach(MIMEText(body, "html", "utf-8"))
       if has_attachments:
-        attach_files(msg, attachments)
+        attach_files(msg, attachments, allow_any_path=allow_any_path)
     else:
       msg = MIMEText(body, "html", "utf-8")
 
@@ -822,7 +893,7 @@ def cmd_draft(account_name, to_addr, subject, body, cc=None, as_html=False, them
       # AppleScript draft path can't easily attach files. Fall back to .eml.
       msg = MIMEMultipart("mixed")
       msg.attach(MIMEText(body, "plain", "utf-8"))
-      attach_files(msg, attachments)
+      attach_files(msg, attachments, allow_any_path=allow_any_path)
       msg["From"] = user
       msg["To"] = to_addr
       msg["Subject"] = subject
@@ -856,7 +927,7 @@ def cmd_draft(account_name, to_addr, subject, body, cc=None, as_html=False, them
   print(json.dumps(output, ensure_ascii=False))
 
 
-def cmd_reply(account_name, msg_id, body, reply_all=False, as_html=False, theme=False, attachments=None, mailbox="INBOX"):
+def cmd_reply(account_name, msg_id, body, reply_all=False, as_html=False, theme=False, attachments=None, mailbox="INBOX", allow_any_path=False):
   """Create a reply draft with proper threading headers."""
   html = as_html  # noqa: A001 — intentional local alias (see cmd_draft)
   m, drafts_folder, user = connect(account_name)
@@ -935,7 +1006,7 @@ def cmd_reply(account_name, msg_id, body, reply_all=False, as_html=False, theme=
       content_type = "html" if html else "plain"
       msg.attach(MIMEText(body, content_type, "utf-8"))
       if has_attachments:
-        attach_files(msg, attachments)
+        attach_files(msg, attachments, allow_any_path=allow_any_path)
     else:
       content_type = "html" if html else "plain"
       msg = MIMEText(body, content_type, "utf-8")
@@ -1000,7 +1071,7 @@ def cmd_reply(account_name, msg_id, body, reply_all=False, as_html=False, theme=
       pass
 
 
-def cmd_forward(account_name, msg_id, to_addr, cc=None, note=None, as_html=False, theme=False, attachments=None, mailbox="INBOX"):
+def cmd_forward(account_name, msg_id, to_addr, cc=None, note=None, as_html=False, theme=False, attachments=None, mailbox="INBOX", allow_any_path=False):
   """Create a forward draft.
 
   First version (Tier 1): forwards text content only, no attachments from the
@@ -1112,7 +1183,7 @@ def cmd_forward(account_name, msg_id, to_addr, cc=None, note=None, as_html=False
       content_type = "html" if html else "plain"
       msg.attach(MIMEText(body, content_type, "utf-8"))
       if has_attachments:
-        attach_files(msg, attachments)
+        attach_files(msg, attachments, allow_any_path=allow_any_path)
     else:
       content_type = "html" if html else "plain"
       msg = MIMEText(body, content_type, "utf-8")
@@ -1336,6 +1407,8 @@ def build_parser():
   p.add_argument("--html", action="store_true")
   p.add_argument("--theme", action="store_true")
   p.add_argument("--attach", action="append", default=None, metavar="FILE")
+  p.add_argument("--allow-any-path", dest="allow_any_path", action="store_true",
+                 help="Bypass attachment path allowlist (default allowlist: ~/Downloads, ~/Desktop, ~/Documents/ai-workspace, /tmp)")
 
   # --- reply ---
   p = sub.add_parser("reply", help="Reply to an email")
@@ -1349,6 +1422,8 @@ def build_parser():
   p.add_argument("--html", action="store_true")
   p.add_argument("--theme", action="store_true")
   p.add_argument("--attach", action="append", default=None, metavar="FILE")
+  p.add_argument("--allow-any-path", dest="allow_any_path", action="store_true",
+                 help="Bypass attachment path allowlist (default allowlist: ~/Downloads, ~/Desktop, ~/Documents/ai-workspace, /tmp)")
 
   # --- forward ---
   p = sub.add_parser("forward", help="Forward an email")
@@ -1364,6 +1439,8 @@ def build_parser():
   p.add_argument("--html", action="store_true")
   p.add_argument("--theme", action="store_true")
   p.add_argument("--attach", action="append", default=None, metavar="FILE")
+  p.add_argument("--allow-any-path", dest="allow_any_path", action="store_true",
+                 help="Bypass attachment path allowlist (default allowlist: ~/Downloads, ~/Desktop, ~/Documents/ai-workspace, /tmp)")
 
   # --- mark_read ---
   p = sub.add_parser("mark_read", help="Mark messages as read")
@@ -1436,7 +1513,8 @@ if __name__ == "__main__":
       cc = validate_email(cc, "cc")
     cmd_draft(account, to_addr, subject, body, cc,
               as_html=args.html, theme=args.theme,
-              attachments=args.attach)
+              attachments=args.attach,
+              allow_any_path=args.allow_any_path)
 
   elif cmd == "reply":
     account = resolve(args.account_flag, args.account_pos)
@@ -1449,7 +1527,8 @@ if __name__ == "__main__":
       sys.exit(1)
     cmd_reply(account, msg_id, body,
               reply_all=args.reply_all, as_html=args.html, theme=args.theme,
-              attachments=args.attach)
+              attachments=args.attach,
+              allow_any_path=args.allow_any_path)
 
   elif cmd == "forward":
     account = resolve(args.account_flag, args.account_pos)
@@ -1467,7 +1546,8 @@ if __name__ == "__main__":
       cc = validate_email(cc, "cc")
     cmd_forward(account, msg_id, to_addr, cc=cc, note=note,
                 as_html=args.html, theme=args.theme,
-                attachments=args.attach)
+                attachments=args.attach,
+                allow_any_path=args.allow_any_path)
 
   elif cmd == "mark_read":
     account = resolve(args.account_flag, args.account_pos)

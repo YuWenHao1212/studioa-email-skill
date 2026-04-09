@@ -324,9 +324,10 @@ work_PASSWORD=密碼
 
 ### 依賴
 
-安裝方式(從 repo):
+安裝方式(從 repo root 裡):
 ```bash
-pip3 install -r ~/GitHub/studioa-email-skill/email/requirements.txt
+cd ~/GitHub/studioa-email-skill  # 或 setup prompt clone 的實際路徑
+pip3 install -r email/requirements.txt
 ```
 
 或手動:
