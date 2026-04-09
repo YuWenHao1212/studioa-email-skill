@@ -308,6 +308,40 @@ work_PASSWORD=密碼
 - 帳號格式依 server 而定（可能是 `user`、`user@domain`、或其他）
 - 密碼是登入 webmail 的密碼，不是 Google App Password
 
+## HTML Sanitization（重要：攻擊者控制的 HTML）
+
+本 fork 會把**原始信件的 HTML body** 透過 `bleach` 過濾後才嵌進轉寄或回覆草稿。原因：惡意寄件者可能在 HTML 裡藏 `<script>`、`<img onerror=>`、`javascript:` URL、`<iframe>`、CSS expression 等 payload — 如果原封不動轉寄給客戶，你會變成攻擊者的跳板，payload 沿著「你 → 客戶」的信任鏈傳播。
+
+### 運作流程
+
+- **使用者/助手生成的 HTML**（`cmd_draft` 的 body、`cmd_reply` 的 body、`cmd_forward` 的 note）→ 只跑 `sanitize_html`（= `rewrite_blockquotes_for_ios`），做 iOS 樣式修補
+- **原信 HTML**（`orig_html` 來自 IMAP fetch）→ 跑 `sanitize_external_html`，用 bleach 白名單過濾：
+  - 允許 tag：`p br div span strong em b i u a img ul ol li blockquote pre code table* h1-h6 hr`
+  - 允許 attr：`a[href,title]`、`img[src,alt,title]`、`table[border,cellpadding,cellspacing]`、`td/th[colspan,rowspan]`
+  - 允許 protocol：`http https mailto cid`
+  - **不允許 `style` attribute**（CSS sanitizer 未整合，下個版本會加 tinycss2）
+- **原信純文字**（`orig_plain`）→ `html.escape()` 後包 `<pre>` 再嵌入
+
+### 依賴
+
+`bleach>=6.0` 必須安裝。Setup prompt Phase 11.5 會自動跑 `pip install`。
+
+**如果 bleach 未安裝**：code fall back 成純文字模式，`orig_html` 會被當 plain text escape 後包 `<pre>` — 安全但失去樣式。使用者看到 `forward --html` 的結果變成純文字時要知道是 bleach 問題。
+
+### 為什麼重要
+
+STUDIO A 教學主管會轉寄各種外部來信（講師提案、客戶投訴、廠商通知）給同事、客戶、老闆。如果不 sanitize，任何一封帶 XSS payload 的來信都能變成攻擊武器。這是企業級 email 工具的基本安全要求。
+
+### 已知未覆蓋
+
+- CSS-based attacks 透過 inline `style=`（已 park 到 tinycss2 整合）
+- `.eml` 檔案權限（未加 chmod 600/700，目前 umask 預設）
+- `account_name` path traversal whitelist（目前沒檢查 `../`）
+
+上述三項已列 tech debt，第三堂課前補完。
+
+---
+
 ## 安全規則
 
 - **草稿優先**：所有信件先存草稿匣，不自動寄出（email_ops.py 沒有 send 指令）

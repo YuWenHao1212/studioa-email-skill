@@ -10,13 +10,50 @@ All operations use standard IMAP protocol.
 import argparse
 import imaplib
 import email
-import html
+import html as html_lib
 import re
 import sys
 import os
 import json
 import mimetypes
 import subprocess
+
+# Optional HTML sanitizer dependency. If bleach is available we use it to
+# strip dangerous tags/attrs/URL schemes from attacker-controlled HTML
+# (original message bodies forwarded to third parties). If bleach is not
+# installed the code falls back to plain-text rendering (safe but loses
+# styling). See SKILL.md for the security rationale.
+try:
+  import bleach
+  HAS_BLEACH = True
+except ImportError:
+  HAS_BLEACH = False
+
+# HTML whitelist — conservative, tuned for quoted mail content
+SANITIZE_ALLOWED_TAGS = [
+  'p', 'br', 'div', 'span',
+  'strong', 'em', 'b', 'i', 'u',
+  'a', 'img',
+  'ul', 'ol', 'li',
+  'blockquote', 'pre', 'code',
+  'table', 'thead', 'tbody', 'tr', 'th', 'td',
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+  'hr',
+]
+# Note: 'style' attribute is intentionally NOT whitelisted. bleach 6.x
+# requires a separate css_sanitizer (tinycss2) to safely allow style attrs;
+# without it style= is stripped entirely. We accept that trade-off — loss
+# of inline styling on forwarded HTML is preferable to risking CSS-based
+# attacks (expression(), url(javascript:...), data: URLs in background, etc.).
+# A future upgrade can add tinycss2 and whitelist safe CSS properties.
+SANITIZE_ALLOWED_ATTRS = {
+  'a': ['href', 'title'],
+  'img': ['src', 'alt', 'title'],
+  'table': ['border', 'cellpadding', 'cellspacing'],
+  'td': ['colspan', 'rowspan'],
+  'th': ['colspan', 'rowspan'],
+}
+SANITIZE_ALLOWED_PROTOCOLS = ['http', 'https', 'mailto', 'cid']
 from datetime import datetime
 from pathlib import Path
 from email.header import decode_header
@@ -232,9 +269,12 @@ def attach_files(msg, file_paths):
     msg.attach(part)
 
 
-def sanitize_html(html_body):
-  """Replace email-unsafe HTML tags to prevent mobile rendering issues.
-  iOS Mail renders <blockquote> as indented blocks with colored bars."""
+def rewrite_blockquotes_for_ios(html_body):
+  """Replace <blockquote> with <div> to avoid iOS Mail rendering bars.
+
+  This is a STYLE fix only — it does NOT sanitize attacker-controlled
+  HTML. For that, use sanitize_external_html() which runs bleach.
+  """
   html_body = re.sub(
     r'<blockquote[^>]*>',
     '<div style="margin:0;padding:0;">',
@@ -250,9 +290,41 @@ def sanitize_html(html_body):
   return html_body
 
 
-def strip_html_tags(html):
+# Backwards-compat alias — cmd_draft/cmd_reply/cmd_forward call this name
+# for locally-produced HTML (assistant-generated body, not external).
+sanitize_html = rewrite_blockquotes_for_ios
+
+
+def sanitize_external_html(html_body):
+  """Sanitize attacker-controlled HTML before forwarding or quoting it.
+
+  Use this on the HTML body of an ORIGINAL message (orig_html from IMAP)
+  before embedding it in a new draft. Without this a malicious sender can
+  inject <script>, javascript: URLs, onerror handlers, etc., that would
+  execute in the recipient's mail client when the victim forwards the
+  message to a trusted third party.
+
+  Falls back to plain-text escape if bleach is not installed (safe but
+  loses styling). See SKILL.md Security section.
+  """
+  if not html_body:
+    return ""
+  if HAS_BLEACH:
+    return bleach.clean(
+      html_body,
+      tags=SANITIZE_ALLOWED_TAGS,
+      attributes=SANITIZE_ALLOWED_ATTRS,
+      protocols=SANITIZE_ALLOWED_PROTOCOLS,
+      strip=True,
+      strip_comments=True,
+    )
+  # Fallback: escape the whole thing — no HTML rendering, but safe
+  return f"<pre>{html_lib.escape(html_body)}</pre>"
+
+
+def strip_html_tags(html_body):
   """Convert HTML to readable plain text. No external dependencies."""
-  text = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+  text = re.sub(r'<style[^>]*>.*?</style>', '', html_body, flags=re.DOTALL | re.IGNORECASE)
   text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)
   text = re.sub(r'<br\s*/?\s*>', '\n', text, flags=re.IGNORECASE)
   text = re.sub(r'</(p|div|tr|li|h[1-6])>', '\n', text, flags=re.IGNORECASE)
@@ -772,10 +844,15 @@ def cmd_reply(account_name, msg_id, body, reply_all=False, html=False, theme=Fal
       if theme:
         body = apply_theme(body)
       # Build HTML quote block — use <div> not <blockquote> (iOS Mail renders blockquote poorly)
-      # Escape quote_header (contains sender display name) and plain-text
-      # fallback to prevent HTML injection via malicious original content.
-      esc_quote_header = html.escape(quote_header)
-      quoted_html = orig_html if orig_html else (f"<pre>{html.escape(orig_plain)}</pre>" if orig_plain else "")
+      # Escape quote_header (contains sender display name) and run
+      # attacker-controlled orig_html through bleach.
+      esc_quote_header = html_lib.escape(quote_header)
+      if orig_html:
+        quoted_html = sanitize_external_html(orig_html)
+      elif orig_plain:
+        quoted_html = f"<pre>{html_lib.escape(orig_plain)}</pre>"
+      else:
+        quoted_html = ""
       if quoted_html:
         body = (
           f"{body}<br><br>"
@@ -933,11 +1010,11 @@ def cmd_forward(account_name, msg_id, to_addr, cc=None, note=None, html=False, t
         body = apply_theme(body)
       # Escape original header values to prevent display names like
       # "Foo <bar@x.com>" from being swallowed as HTML tags.
-      esc_from = html.escape(orig_from)
-      esc_date = html.escape(orig_date)
-      esc_subject = html.escape(orig_subject)
-      esc_to = html.escape(orig_to)
-      esc_cc = html.escape(orig_cc) if orig_cc else ""
+      esc_from = html_lib.escape(orig_from)
+      esc_date = html_lib.escape(orig_date)
+      esc_subject = html_lib.escape(orig_subject)
+      esc_to = html_lib.escape(orig_to)
+      esc_cc = html_lib.escape(orig_cc) if orig_cc else ""
       fwd_header_html = (
         '<div style="border-top:1px solid #ccc;margin-top:20px;padding-top:10px;color:#666;">'
         "<p><strong>---------- Forwarded message ----------</strong></p>"
@@ -949,9 +1026,14 @@ def cmd_forward(account_name, msg_id, to_addr, cc=None, note=None, html=False, t
       if esc_cc:
         fwd_header_html += f"<br>Cc: {esc_cc}"
       fwd_header_html += "</p></div>"
-      # orig_html is already HTML (from sender), trust as-is; for plain text
-      # fallback wrap in <pre> with escaped content to prevent injection.
-      quoted_html = orig_html if orig_html else (f"<pre>{html.escape(orig_plain)}</pre>" if orig_plain else "")
+      # orig_html is attacker-controlled — run through bleach before embed.
+      # If orig has no HTML, fall back to escaped plain text in <pre>.
+      if orig_html:
+        quoted_html = sanitize_external_html(orig_html)
+      elif orig_plain:
+        quoted_html = f"<pre>{html_lib.escape(orig_plain)}</pre>"
+      else:
+        quoted_html = ""
       body = f"{body}<br><br>{fwd_header_html}{quoted_html}"
     else:
       quoted_plain = orig_plain or ""
