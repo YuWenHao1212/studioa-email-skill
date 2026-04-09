@@ -128,6 +128,9 @@ ENV_FILE = os.environ.get("EMAIL_ENV_FILE", os.path.join(SCRIPT_DIR, ".env.email
 TEMPLATE_DIR = os.path.join(os.path.dirname(SCRIPT_DIR), "templates")
 
 # Provider presets
+# "imap" is a generic provider for self-hosted mail servers (e.g. STUDIO A's
+# Nusoft server). It has no default host — callers must supply {name}_HOST in
+# .env.email. Port defaults to 143 (STARTTLS) but can be overridden.
 PROVIDERS = {
   "gmail": {
     "host": "imap.gmail.com",
@@ -137,6 +140,11 @@ PROVIDERS = {
   "outlook": {
     "host": "outlook.office365.com",
     "port": 993,
+    "drafts_folder": "Drafts",
+  },
+  "imap": {
+    "host": "",
+    "port": 143,
     "drafts_folder": "Drafts",
   },
 }
@@ -162,12 +170,19 @@ def get_accounts():
 
   Expected format in .env.email:
     ACCOUNTS=work,personal       (comma-separated account names)
-    work_PROVIDER=gmail          (gmail or outlook)
+    work_PROVIDER=gmail          (gmail, outlook, or imap)
     work_USER=you@gmail.com
     work_PASSWORD=xxxx-xxxx-xxxx-xxxx
     personal_PROVIDER=outlook
     personal_USER=you@company.com
     personal_PASSWORD=xxxx
+
+  Generic 'imap' provider (for self-hosted servers like STUDIO A):
+    studioa_PROVIDER=imap
+    studioa_HOST=studioa.com.tw    (required — no default)
+    studioa_PORT=143               (optional, defaults to 143)
+    studioa_USER=kat.chang@studioa.com.tw
+    studioa_PASSWORD=xxxx
   """
   env = load_env()
   account_names = [a.strip() for a in env.get("ACCOUNTS", "default").split(",")]
@@ -183,6 +198,12 @@ def get_accounts():
     if not user or not password:
       print(json.dumps({"error": f"Missing USER or PASSWORD for account '{name}'"}))
       sys.exit(1)
+    # Resolve host: user override wins, otherwise fall back to provider preset
+    host = env.get(f"{name}_HOST", provider["host"])
+    # Generic 'imap' provider has no default host — must be supplied by user
+    if provider_key == "imap" and not host:
+      print(json.dumps({"error": f"Provider 'imap' requires {name}_HOST to be set in .env.email (no default for self-hosted servers)"}))
+      sys.exit(1)
     # Allow per-account override of drafts folder
     drafts = env.get(f"{name}_DRAFTS_FOLDER", provider["drafts_folder"])
     port = int(env.get(f"{name}_PORT", provider["port"]))
@@ -191,7 +212,7 @@ def get_accounts():
     if not security:
       security = "ssl" if port == 993 else "starttls"
     accounts[name] = {
-      "host": env.get(f"{name}_HOST", provider["host"]),
+      "host": host,
       "port": port,
       "security": security,
       "user": user,
@@ -792,43 +813,60 @@ def _save_via_eml(msg, account_name):
   return str(eml_path), opened
 
 
-def _load_user_address(account_name):
-  """Read EMAIL_<ACCOUNT>_USER from .env.email without connecting to IMAP.
+def _load_env_value(account_name, suffix):
+  """Read {name}_{SUFFIX} from env vars or .env.email, with legacy fallback.
 
-  cmd_draft no longer needs IMAP, so we just need the From address.
+  Primary key format:  {account_name}_{SUFFIX}           (e.g. personal_USER)
+  Legacy key format:   EMAIL_{ACCOUNT_NAME}_{SUFFIX}      (e.g. EMAIL_PERSONAL_USER)
+
+  The legacy EMAIL_ prefix format is kept for backward compatibility with
+  existing .env.email files. New installs should use the short form which
+  matches the keys read by get_accounts().
+
+  Returns empty string if neither form is found.
   """
-  user = os.environ.get(f"EMAIL_{account_name.upper()}_USER", "")
-  if user:
-    return user
+  primary_key = f"{account_name}_{suffix}"
+  legacy_key = f"EMAIL_{account_name.upper()}_{suffix}"
+
+  # Environment variables win over .env.email file
+  for key in (primary_key, legacy_key):
+    val = os.environ.get(key, "")
+    if val:
+      return val
+
   if os.path.exists(ENV_FILE):
     with open(ENV_FILE) as f:
       for line in f:
         line = line.strip()
-        if line.startswith(f"EMAIL_{account_name.upper()}_USER="):
-          return line.split("=", 1)[1].strip().strip('"').strip("'")
+        for key in (primary_key, legacy_key):
+          if line.startswith(f"{key}="):
+            return line.split("=", 1)[1].strip().strip('"').strip("'")
   return ""
 
 
+def _load_user_address(account_name):
+  """Read <account>_USER from .env.email without connecting to IMAP.
+
+  cmd_draft no longer needs IMAP, so we just need the From address.
+  Accepts both primary ({name}_USER) and legacy (EMAIL_{NAME}_USER) formats.
+  """
+  return _load_env_value(account_name, "USER")
+
+
 def _load_apple_sender(account_name):
-  """Read EMAIL_<ACCOUNT>_APPLE_SENDER from .env.email.
+  """Read <account>_APPLE_SENDER from .env.email.
 
   Format: "Full Name <email@example.com>" — must match an account that Apple
   Mail already has configured. Used by AppleScript dispatch to route plain-
   text drafts to the correct account's local drafts mailbox.
 
+  Accepts both primary ({name}_APPLE_SENDER) and legacy
+  (EMAIL_{NAME}_APPLE_SENDER) formats.
+
   Returns empty string if not configured (caller falls back to Apple Mail's
   default account).
   """
-  sender = os.environ.get(f"EMAIL_{account_name.upper()}_APPLE_SENDER", "")
-  if sender:
-    return sender
-  if os.path.exists(ENV_FILE):
-    with open(ENV_FILE) as f:
-      for line in f:
-        line = line.strip()
-        if line.startswith(f"EMAIL_{account_name.upper()}_APPLE_SENDER="):
-          return line.split("=", 1)[1].strip().strip('"').strip("'")
-  return ""
+  return _load_env_value(account_name, "APPLE_SENDER")
 
 
 def cmd_draft(account_name, to_addr, subject, body, cc=None, as_html=False, theme=False, attachments=None, allow_any_path=False):
