@@ -18,42 +18,96 @@ import json
 import mimetypes
 import subprocess
 
-# Optional HTML sanitizer dependency. If bleach is available we use it to
-# strip dangerous tags/attrs/URL schemes from attacker-controlled HTML
-# (original message bodies forwarded to third parties). If bleach is not
-# installed the code falls back to plain-text rendering (safe but loses
-# styling). See SKILL.md for the security rationale.
+# HTML sanitizer dependencies. bleach handles tag/attr whitelisting,
+# tinycss2 (via bleach.css_sanitizer) handles CSS property whitelisting
+# for inline style="" attributes. Both are listed in requirements.txt.
+# If either is missing we degrade gracefully:
+#   - no bleach → fall back to <pre>{html.escape(...)}</pre> (safe, no styling)
+#   - bleach but no tinycss2 → strip all style attrs (safe, most styling lost)
 try:
   import bleach
   HAS_BLEACH = True
 except ImportError:
   HAS_BLEACH = False
 
-# HTML whitelist — conservative, tuned for quoted mail content
+try:
+  from bleach.css_sanitizer import CSSSanitizer
+  HAS_CSS_SANITIZER = True
+except ImportError:
+  HAS_CSS_SANITIZER = False
+
+# Tag whitelist — conservative, tuned for quoted mail content
 SANITIZE_ALLOWED_TAGS = [
   'p', 'br', 'div', 'span',
-  'strong', 'em', 'b', 'i', 'u',
+  'strong', 'em', 'b', 'i', 'u', 'font',
   'a', 'img',
   'ul', 'ol', 'li',
   'blockquote', 'pre', 'code',
-  'table', 'thead', 'tbody', 'tr', 'th', 'td',
+  'table', 'thead', 'tbody', 'tfoot', 'tr', 'th', 'td', 'caption', 'col', 'colgroup',
   'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
   'hr',
 ]
-# Note: 'style' attribute is intentionally NOT whitelisted. bleach 6.x
-# requires a separate css_sanitizer (tinycss2) to safely allow style attrs;
-# without it style= is stripped entirely. We accept that trade-off — loss
-# of inline styling on forwarded HTML is preferable to risking CSS-based
-# attacks (expression(), url(javascript:...), data: URLs in background, etc.).
-# A future upgrade can add tinycss2 and whitelist safe CSS properties.
+
+# Attribute whitelist — includes presentational attrs that real-world
+# Outlook / Gmail / newsletter HTML relies on (width, height, align,
+# valign, bgcolor, dir). 'style' is included but filtered via CSSSanitizer
+# below so only safe CSS properties survive.
+_PRESENTATIONAL = ['style', 'width', 'height', 'align', 'valign', 'bgcolor', 'dir']
 SANITIZE_ALLOWED_ATTRS = {
-  'a': ['href', 'title'],
-  'img': ['src', 'alt', 'title'],
-  'table': ['border', 'cellpadding', 'cellspacing'],
-  'td': ['colspan', 'rowspan'],
-  'th': ['colspan', 'rowspan'],
+  'a': ['href', 'title', 'style', 'dir'],
+  'img': ['src', 'alt', 'title', 'width', 'height', 'align', 'style', 'border'],
+  'font': ['color', 'face', 'size'],
+  'p': _PRESENTATIONAL,
+  'div': _PRESENTATIONAL,
+  'span': ['style', 'dir'],
+  'table': _PRESENTATIONAL + ['border', 'cellpadding', 'cellspacing', 'summary'],
+  'thead': _PRESENTATIONAL,
+  'tbody': _PRESENTATIONAL,
+  'tfoot': _PRESENTATIONAL,
+  'tr': _PRESENTATIONAL,
+  'td': _PRESENTATIONAL + ['colspan', 'rowspan', 'scope', 'headers'],
+  'th': _PRESENTATIONAL + ['colspan', 'rowspan', 'scope', 'headers'],
+  'col': ['span', 'style', 'width'],
+  'colgroup': ['span', 'style'],
+  'h1': _PRESENTATIONAL, 'h2': _PRESENTATIONAL, 'h3': _PRESENTATIONAL,
+  'h4': _PRESENTATIONAL, 'h5': _PRESENTATIONAL, 'h6': _PRESENTATIONAL,
+  'ul': _PRESENTATIONAL, 'ol': _PRESENTATIONAL, 'li': _PRESENTATIONAL,
+  'blockquote': _PRESENTATIONAL, 'pre': _PRESENTATIONAL, 'code': _PRESENTATIONAL,
+  'hr': ['style', 'width', 'align'],
 }
-SANITIZE_ALLOWED_PROTOCOLS = ['http', 'https', 'mailto', 'cid']
+
+# URL protocol whitelist. 'cid:' is excluded because forward Tier 1 does
+# not re-attach original inline MIME parts — keeping cid: would leave
+# broken image references in forwarded mail.
+SANITIZE_ALLOWED_PROTOCOLS = ['http', 'https', 'mailto']
+
+# Safe CSS properties — tuned for presentational email HTML. Excludes
+# position/float (layout attacks), background-image (url() injection),
+# behavior (IE expression() attacks), and anything URL-bearing beyond
+# our limited set.
+SANITIZE_ALLOWED_CSS_PROPERTIES = [
+  'color', 'background-color',
+  'font-family', 'font-size', 'font-style', 'font-weight', 'font-variant',
+  'text-align', 'text-decoration', 'text-indent', 'text-transform',
+  'line-height', 'letter-spacing', 'word-spacing', 'white-space',
+  'vertical-align',
+  'border', 'border-top', 'border-right', 'border-bottom', 'border-left',
+  'border-color', 'border-style', 'border-width', 'border-radius',
+  'border-collapse', 'border-spacing',
+  'padding', 'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
+  'margin', 'margin-top', 'margin-right', 'margin-bottom', 'margin-left',
+  'width', 'height', 'min-width', 'max-width', 'min-height', 'max-height',
+  'display', 'visibility',
+  'list-style', 'list-style-type', 'list-style-position',
+  'table-layout', 'caption-side',
+  'direction',
+]
+
+# Pre-build CSS sanitizer instance so it's reused across calls
+if HAS_CSS_SANITIZER:
+  _CSS_SANITIZER = CSSSanitizer(allowed_css_properties=SANITIZE_ALLOWED_CSS_PROPERTIES)
+else:
+  _CSS_SANITIZER = None
 from datetime import datetime
 from pathlib import Path
 from email.header import decode_header
@@ -310,14 +364,16 @@ def sanitize_external_html(html_body):
   if not html_body:
     return ""
   if HAS_BLEACH:
-    return bleach.clean(
-      html_body,
+    kwargs = dict(
       tags=SANITIZE_ALLOWED_TAGS,
       attributes=SANITIZE_ALLOWED_ATTRS,
       protocols=SANITIZE_ALLOWED_PROTOCOLS,
       strip=True,
       strip_comments=True,
     )
+    if _CSS_SANITIZER is not None:
+      kwargs["css_sanitizer"] = _CSS_SANITIZER
+    return bleach.clean(html_body, **kwargs)
   # Fallback: escape the whole thing — no HTML rendering, but safe
   return f"<pre>{html_lib.escape(html_body)}</pre>"
 
@@ -704,7 +760,12 @@ def _load_apple_sender(account_name):
   return ""
 
 
-def cmd_draft(account_name, to_addr, subject, body, cc=None, html=False, theme=False, attachments=None):
+def cmd_draft(account_name, to_addr, subject, body, cc=None, as_html=False, theme=False, attachments=None):
+  # Internal alias retained to avoid a large rename inside this function.
+  # Callers of the NAME "html" inside this function get the local bool,
+  # not the html module — the module is imported as `html_lib` precisely
+  # to dodge this shadow. See CRITICAL C1 in the audit history.
+  html = as_html  # noqa: A001 — intentional local alias
   """Create a draft email in Apple Mail.
 
   STUDIO A mode (hybrid):
@@ -795,8 +856,9 @@ def cmd_draft(account_name, to_addr, subject, body, cc=None, html=False, theme=F
   print(json.dumps(output, ensure_ascii=False))
 
 
-def cmd_reply(account_name, msg_id, body, reply_all=False, html=False, theme=False, attachments=None, mailbox="INBOX"):
+def cmd_reply(account_name, msg_id, body, reply_all=False, as_html=False, theme=False, attachments=None, mailbox="INBOX"):
   """Create a reply draft with proper threading headers."""
+  html = as_html  # noqa: A001 — intentional local alias (see cmd_draft)
   m, drafts_folder, user = connect(account_name)
   try:
     drafts_folder = detect_drafts_folder(m, drafts_folder)
@@ -938,7 +1000,7 @@ def cmd_reply(account_name, msg_id, body, reply_all=False, html=False, theme=Fal
       pass
 
 
-def cmd_forward(account_name, msg_id, to_addr, cc=None, note=None, html=False, theme=False, attachments=None, mailbox="INBOX"):
+def cmd_forward(account_name, msg_id, to_addr, cc=None, note=None, as_html=False, theme=False, attachments=None, mailbox="INBOX"):
   """Create a forward draft.
 
   First version (Tier 1): forwards text content only, no attachments from the
@@ -949,6 +1011,7 @@ def cmd_forward(account_name, msg_id, to_addr, cc=None, note=None, html=False, t
   the caller is expected to have run them through validate_email first so they
   arrive here already normalised to comma-separated form.
   """
+  html = as_html  # noqa: A001 — intentional local alias (see cmd_draft)
   m, _, user = connect(account_name)
   try:
     m.select(mailbox)
@@ -1372,7 +1435,7 @@ if __name__ == "__main__":
     if cc:
       cc = validate_email(cc, "cc")
     cmd_draft(account, to_addr, subject, body, cc,
-              html=args.html, theme=args.theme,
+              as_html=args.html, theme=args.theme,
               attachments=args.attach)
 
   elif cmd == "reply":
@@ -1385,7 +1448,7 @@ if __name__ == "__main__":
                          "usage": "reply <account> <msg_id> <body> [--all] [--html] [--theme] [--attach file]"}))
       sys.exit(1)
     cmd_reply(account, msg_id, body,
-              reply_all=args.reply_all, html=args.html, theme=args.theme,
+              reply_all=args.reply_all, as_html=args.html, theme=args.theme,
               attachments=args.attach)
 
   elif cmd == "forward":
@@ -1403,7 +1466,7 @@ if __name__ == "__main__":
     if cc:
       cc = validate_email(cc, "cc")
     cmd_forward(account, msg_id, to_addr, cc=cc, note=note,
-                html=args.html, theme=args.theme,
+                as_html=args.html, theme=args.theme,
                 attachments=args.attach)
 
   elif cmd == "mark_read":
