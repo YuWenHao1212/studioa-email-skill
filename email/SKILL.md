@@ -101,8 +101,9 @@ account: {帳號名稱}
 | `recent {account} [limit]` | 列出最近 N 封信（已讀＋未讀，預設 3） |
 | `read {account} <id>` | 讀一封信的完整內容 |
 | `search {account} <query> [limit]` | 搜尋信件（支援中文） |
-| `draft {account} <to> <subject> <body> [cc] [--html] [--theme] [--attach file]` | 產草稿 |
+| `draft {account} <to> <subject> <body> [cc] [--html] [--theme] [--attach file]` | 產草稿。`to` 和 `cc` 都支援多收件人（逗號或分號分隔） |
 | `reply {account} <id> <body> [--all] [--html] [--theme] [--attach file]` | 回覆（自動帶入原信引用：plain 用 `> ` 前綴，HTML 用 `<div>` 縮排） |
+| `forward {account} <id> <to> [note] [--cc cc] [--html] [--theme] [--attach file]` | 轉寄一封信給其他人。`to` / `cc` 支援多收件人。⚠️ 目前只轉寄文字內容，不會帶原信附件（見下方 Forward 限制） |
 | `mark_read {account} <id> [id...]` | 標記已讀 |
 | `list_folders {account}` | 列出所有信箱資料夾 |
 
@@ -114,6 +115,80 @@ account: {帳號名稱}
 > draft 的 `to` 和 `cc` 會驗證 email 格式，寫反會報錯。
 >
 > 查看完整說明：`email_ops.py --help` 或 `email_ops.py draft --help`
+
+## Forward（轉寄）
+
+### 使用時機
+
+`forward` 跟 `reply` 是不同動作：
+
+- **reply** = 回給原寄件人（繼續同一個對話 thread）
+- **forward** = 把現有 email 轉發給**新的收件人**（開新 thread）
+
+常見 forward 場景：
+- 講師寄課程提案 → 轉寄給老闆 / 部門決策者
+- 客戶投訴 → 轉寄給相關同事處理
+- 會議通知 → 轉寄給沒被加進去的同事
+- 學員報名確認 → 轉寄給教務 / 會計
+
+使用者說「**把這封信轉給 X**」「**幫我把這封寄給 Y 看**」「**forward 給 ___**」時用這個指令。
+
+### 指令格式
+
+```bash
+# 最簡：轉寄給單一人，無額外說明
+email_ops.py forward {account} <msg_id> <to>
+
+# 多收件人（to / cc 都支援逗號或分號分隔）
+email_ops.py forward {account} <msg_id> "a@x.com,b@y.com" --cc "c@z.com;d@w.com"
+
+# 加轉寄說明（會顯示在原信內容上方）
+email_ops.py forward {account} <msg_id> <to> "請幫忙看一下這個"
+# 或用 flag
+email_ops.py forward {account} <msg_id> <to> --note "請幫忙看一下這個"
+
+# HTML 格式
+email_ops.py forward {account} <msg_id> <to> "說明" --html --theme
+```
+
+### Subject 自動處理
+
+- 原主旨 `課程提案` → forward 後 `Fwd: 課程提案`
+- 原主旨已經有 `Fwd: ` 前綴 → 不會重複加
+
+### ⚠️ Tier 1 限制：不帶附件
+
+**目前版本只轉寄文字內容**，**不會**把原信的附件一起轉過去。如果原信有附件：
+
+1. script 會在輸出中列出原信的附件名稱（`original_attachments` 欄位）
+2. 會附上一則 `attachment_hint`：建議使用者在 Apple Mail 草稿視窗**手動拖曳附件進去**
+
+使用者流程範例：
+- 使用者說「把講師寄的課程提案轉給老闆看」
+- 原信有 `proposal.pdf` 附件
+- 執行 `forward` → 產出草稿（只有文字），輸出告知「原信有 1 個附件 proposal.pdf 未轉寄」
+- 告訴使用者：「草稿已建好，原信的 proposal.pdf 請在 Apple Mail 手動拖進去再送出」
+
+### Forward body 格式
+
+轉寄的 body 結構：
+
+```
+（使用者提供的 note，如果有）
+
+---------- Forwarded message ----------
+From: 原寄件人 <foo@bar.com>
+Date: 原信日期
+Subject: 原主旨
+To: 原收件人
+Cc: 原 cc（如果有）
+
+[原信完整內容]
+```
+
+這是業界標準（Gmail / Outlook / Apple Mail 都這樣）。
+
+---
 
 ## STUDIO A 草稿模式（重要：跟主線 claude-email-skill 不同）
 

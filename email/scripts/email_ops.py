@@ -520,11 +520,13 @@ def _save_via_applescript(to_addr, subject, body, cc=None, sender=None):
 
   Returns (mode_string, opened_in_mail_bool).
   """
-  recipient_blocks = [
-    f'make new to recipient with properties {{address:"{_applescript_quote(to_addr)}"}}'
-  ]
+  recipient_blocks = []
+  for addr in [a.strip() for a in re.split(r'[,;]', to_addr) if a.strip()]:
+    recipient_blocks.append(
+      f'make new to recipient with properties {{address:"{_applescript_quote(addr)}"}}'
+    )
   if cc:
-    for addr in [a.strip() for a in cc.split(",") if a.strip()]:
+    for addr in [a.strip() for a in re.split(r'[,;]', cc) if a.strip()]:
       recipient_blocks.append(
         f'make new cc recipient with properties {{address:"{_applescript_quote(addr)}"}}'
       )
@@ -855,6 +857,162 @@ def cmd_reply(account_name, msg_id, body, reply_all=False, html=False, theme=Fal
       pass
 
 
+def cmd_forward(account_name, msg_id, to_addr, cc=None, note=None, html=False, theme=False, attachments=None, mailbox="INBOX"):
+  """Create a forward draft.
+
+  First version (Tier 1): forwards text content only, no attachments from the
+  original message. If the original had attachments, a note in the output hints
+  the user to drag them in manually via Apple Mail.
+
+  Supports multiple recipients (to / cc) via comma or semicolon separators;
+  the caller is expected to have run them through validate_email first so they
+  arrive here already normalised to comma-separated form.
+  """
+  m, _, user = connect(account_name)
+  try:
+    m.select(mailbox)
+    _, msg_data = m.fetch(msg_id.encode(), "(BODY.PEEK[HEADER.FIELDS (FROM TO CC SUBJECT MESSAGE-ID DATE)])")
+    if not msg_data or not isinstance(msg_data[0], tuple):
+      print(json.dumps({"error": "Original message not found"}))
+      return
+
+    orig = email.message_from_bytes(msg_data[0][1])
+    orig_from = decode_addr(orig.get("From", ""))
+    orig_to = decode_addr(orig.get("To", ""))
+    orig_cc = decode_addr(orig.get("Cc", ""))
+    orig_subject = decode_subject(orig.get("Subject"))
+    orig_date = orig.get("Date", "")
+
+    fwd_subject = orig_subject if orig_subject.startswith("Fwd:") else f"Fwd: {orig_subject}"
+
+    # Fetch original body for inclusion (fail-safe: empty strings if anything goes wrong)
+    orig_plain, orig_html, _, _ = fetch_original_for_quote(m, msg_id, mailbox)
+
+    # Detect attachments in the original (for hint only — Tier 1 does not forward them)
+    orig_attachments = []
+    try:
+      _, full_data = m.fetch(msg_id.encode(), "(BODY.PEEK[])")
+      if full_data and isinstance(full_data[0], tuple):
+        full_msg = email.message_from_bytes(full_data[0][1])
+        if full_msg.is_multipart():
+          for part in full_msg.walk():
+            cd = str(part.get("Content-Disposition", ""))
+            if "attachment" in cd:
+              fn = part.get_filename()
+              if fn:
+                orig_attachments.append(decode_subject(fn))
+    except Exception:
+      pass
+
+    note_text = note or ""
+
+    # Build forwarded header block
+    fwd_header_text = (
+      "---------- Forwarded message ----------\n"
+      f"From: {orig_from}\n"
+      f"Date: {orig_date}\n"
+      f"Subject: {orig_subject}\n"
+      f"To: {orig_to}\n"
+    )
+    if orig_cc:
+      fwd_header_text += f"Cc: {orig_cc}\n"
+
+    if html:
+      body = sanitize_html(note_text)
+      if theme:
+        body = apply_theme(body)
+      fwd_header_html = (
+        '<div style="border-top:1px solid #ccc;margin-top:20px;padding-top:10px;color:#666;">'
+        "<p><strong>---------- Forwarded message ----------</strong></p>"
+        f"<p>From: {orig_from}<br>"
+        f"Date: {orig_date}<br>"
+        f"Subject: {orig_subject}<br>"
+        f"To: {orig_to}"
+      )
+      if orig_cc:
+        fwd_header_html += f"<br>Cc: {orig_cc}"
+      fwd_header_html += "</p></div>"
+      quoted_html = orig_html if orig_html else (f"<pre>{orig_plain}</pre>" if orig_plain else "")
+      body = f"{body}<br><br>{fwd_header_html}{quoted_html}"
+    else:
+      quoted_plain = orig_plain or ""
+      body = (
+        f"{note_text}\n\n" if note_text else ""
+      ) + fwd_header_text + "\n" + quoted_plain
+
+    has_attachments = attachments and len(attachments) > 0
+    needs_multipart = has_attachments or (html and theme)
+
+    if needs_multipart:
+      msg = MIMEMultipart()
+      content_type = "html" if html else "plain"
+      msg.attach(MIMEText(body, content_type, "utf-8"))
+      if has_attachments:
+        attach_files(msg, attachments)
+    else:
+      content_type = "html" if html else "plain"
+      msg = MIMEText(body, content_type, "utf-8")
+
+    msg["From"] = user
+    msg["To"] = to_addr
+    msg["Subject"] = fwd_subject
+    msg["Date"] = formatdate(localtime=True)
+    if cc:
+      msg["Cc"] = cc
+
+    try:
+      m.logout()
+    except Exception:
+      pass
+
+    if html or has_attachments:
+      eml_path, opened = _save_via_eml(msg, account_name)
+      output = {
+        "mode": "html-eml" if html else "plain-eml-with-attachments",
+        "path": eml_path,
+        "opened_in_mail": opened,
+        "account": account_name,
+        "to": to_addr,
+        "cc": cc or "",
+        "subject": fwd_subject,
+        "hint": "Apple Mail 已彈出轉寄視窗。要存草稿請按 Cmd+S → 選 folder → 關視窗（HTML 或附件場景的已知限制，多 2 步）。",
+      }
+      if has_attachments:
+        output["attachments"] = [os.path.basename(f) for f in attachments]
+    else:
+      sender = _load_apple_sender(account_name)
+      mode, opened = _save_via_applescript(
+        to_addr, fwd_subject, body,
+        cc=cc if cc else None,
+        sender=sender,
+      )
+      output = {
+        "mode": "plain-applescript",
+        "opened_in_mail": opened,
+        "account": account_name,
+        "sender": sender or "(default)",
+        "to": to_addr,
+        "cc": cc or "",
+        "subject": fwd_subject,
+        "hint": "Apple Mail 已彈出轉寄視窗。按 Cmd+S 直接存進本機草稿匣（一鍵）。",
+      }
+
+    if orig_attachments:
+      output["original_attachments"] = orig_attachments
+      output["attachment_hint"] = (
+        f"原信有 {len(orig_attachments)} 個附件未轉寄（Tier 1 限制）：{', '.join(orig_attachments)}。"
+        "如需附件，請在 Apple Mail 草稿視窗手動拖曳進去。"
+      )
+
+    print(json.dumps(output, ensure_ascii=False))
+    return
+  finally:
+    try:
+      m.logout()
+    except Exception:
+      pass
+
+
 def cmd_mark_read(account_name, msg_ids, mailbox="INBOX"):
   """Mark messages as read."""
   m, _, _ = connect(account_name)
@@ -945,10 +1103,25 @@ def resolve(*values):
 
 
 def validate_email(addr, label="to"):
-  """Validate email format. Exit with JSON error if invalid."""
-  if not re.match(r'^[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}$', addr):
-    print(json.dumps({"error": f"{label} '{addr[:50]}' is not a valid email."}))
+  """Validate email format. Exit with JSON error if invalid.
+
+  Supports multiple recipients separated by comma or semicolon. Returns the
+  normalised comma-separated string (stripped, semicolons converted to commas)
+  so callers can pass it downstream unchanged.
+  """
+  if not addr:
+    print(json.dumps({"error": f"{label} is empty."}))
     sys.exit(1)
+  # Split on either , or ; then strip whitespace
+  parts = [p.strip() for p in re.split(r'[,;]', addr) if p.strip()]
+  if not parts:
+    print(json.dumps({"error": f"{label} '{addr[:50]}' has no valid addresses."}))
+    sys.exit(1)
+  for p in parts:
+    if not re.match(r'^[^@\s,;]+@[^@\s,;]+\.[a-zA-Z]{2,}$', p):
+      print(json.dumps({"error": f"{label} contains invalid email '{p[:50]}'."}))
+      sys.exit(1)
+  return ", ".join(parts)
 
 
 def build_parser():
@@ -1009,6 +1182,21 @@ def build_parser():
   p.add_argument("--id", dest="id_flag", default=None)
   p.add_argument("--body", dest="body_flag", default=None)
   p.add_argument("--all", dest="reply_all", action="store_true")
+  p.add_argument("--html", action="store_true")
+  p.add_argument("--theme", action="store_true")
+  p.add_argument("--attach", action="append", default=None, metavar="FILE")
+
+  # --- forward ---
+  p = sub.add_parser("forward", help="Forward an email")
+  p.add_argument("account_pos", nargs="?", default=None)
+  p.add_argument("msg_id_pos", nargs="?", default=None)
+  p.add_argument("to_pos", nargs="?", default=None)
+  p.add_argument("note_pos", nargs="?", default=None, help="Optional note prepended to the forwarded content")
+  p.add_argument("--account", dest="account_flag", default=None)
+  p.add_argument("--id", dest="id_flag", default=None)
+  p.add_argument("--to", dest="to_flag", default=None)
+  p.add_argument("--cc", dest="cc_flag", default=None)
+  p.add_argument("--note", dest="note_flag", default=None)
   p.add_argument("--html", action="store_true")
   p.add_argument("--theme", action="store_true")
   p.add_argument("--attach", action="append", default=None, metavar="FILE")
@@ -1079,9 +1267,9 @@ if __name__ == "__main__":
       print(json.dumps({"error": f"Missing required arguments: {', '.join(missing)}",
                          "usage": "draft <account> <to> <subject> <body> [cc] [--html] [--theme] [--attach file]"}))
       sys.exit(1)
-    validate_email(to_addr, "to")
+    to_addr = validate_email(to_addr, "to")
     if cc:
-      validate_email(cc, "cc")
+      cc = validate_email(cc, "cc")
     cmd_draft(account, to_addr, subject, body, cc,
               html=args.html, theme=args.theme,
               attachments=args.attach)
@@ -1098,6 +1286,24 @@ if __name__ == "__main__":
     cmd_reply(account, msg_id, body,
               reply_all=args.reply_all, html=args.html, theme=args.theme,
               attachments=args.attach)
+
+  elif cmd == "forward":
+    account = resolve(args.account_flag, args.account_pos)
+    msg_id = resolve(args.id_flag, args.msg_id_pos)
+    to_addr = resolve(args.to_flag, args.to_pos)
+    cc = args.cc_flag
+    note = resolve(args.note_flag, args.note_pos)
+    if not all([account, msg_id, to_addr]):
+      missing = [n for n, v in [("account", account), ("id", msg_id), ("to", to_addr)] if not v]
+      print(json.dumps({"error": f"Missing required arguments: {', '.join(missing)}",
+                         "usage": "forward <account> <msg_id> <to> [note] [--cc cc] [--html] [--theme] [--attach file]"}))
+      sys.exit(1)
+    to_addr = validate_email(to_addr, "to")
+    if cc:
+      cc = validate_email(cc, "cc")
+    cmd_forward(account, msg_id, to_addr, cc=cc, note=note,
+                html=args.html, theme=args.theme,
+                attachments=args.attach)
 
   elif cmd == "mark_read":
     account = resolve(args.account_flag, args.account_pos)
