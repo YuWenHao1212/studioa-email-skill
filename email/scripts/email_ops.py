@@ -10,6 +10,7 @@ All operations use standard IMAP protocol.
 import argparse
 import imaplib
 import email
+import html
 import re
 import sys
 import os
@@ -771,12 +772,15 @@ def cmd_reply(account_name, msg_id, body, reply_all=False, html=False, theme=Fal
       if theme:
         body = apply_theme(body)
       # Build HTML quote block — use <div> not <blockquote> (iOS Mail renders blockquote poorly)
-      quoted_html = orig_html if orig_html else (f"<pre>{orig_plain}</pre>" if orig_plain else "")
+      # Escape quote_header (contains sender display name) and plain-text
+      # fallback to prevent HTML injection via malicious original content.
+      esc_quote_header = html.escape(quote_header)
+      quoted_html = orig_html if orig_html else (f"<pre>{html.escape(orig_plain)}</pre>" if orig_plain else "")
       if quoted_html:
         body = (
           f"{body}<br><br>"
           f'<div style="border-left:2px solid #ccc;padding-left:10px;color:#666;">'
-          f"<p>{quote_header}</p>{quoted_html}</div>"
+          f"<p>{esc_quote_header}</p>{quoted_html}</div>"
         )
     else:
       # Plain text quote block — RFC 3676 "> " prefix
@@ -883,7 +887,13 @@ def cmd_forward(account_name, msg_id, to_addr, cc=None, note=None, html=False, t
     orig_subject = decode_subject(orig.get("Subject"))
     orig_date = orig.get("Date", "")
 
-    fwd_subject = orig_subject if orig_subject.startswith("Fwd:") else f"Fwd: {orig_subject}"
+    # Detect existing forward prefixes from any major mail client to avoid
+    # double-prefixing (e.g. "Fwd: FW: ..." when forwarding an Outlook message).
+    _subject_lower = orig_subject.lstrip().lower()
+    if _subject_lower.startswith(("fwd:", "fw:", "轉寄:", "轉寄：")):
+      fwd_subject = orig_subject
+    else:
+      fwd_subject = f"Fwd: {orig_subject}"
 
     # Fetch original body for inclusion (fail-safe: empty strings if anything goes wrong)
     orig_plain, orig_html, _, _ = fetch_original_for_quote(m, msg_id, mailbox)
@@ -921,18 +931,27 @@ def cmd_forward(account_name, msg_id, to_addr, cc=None, note=None, html=False, t
       body = sanitize_html(note_text)
       if theme:
         body = apply_theme(body)
+      # Escape original header values to prevent display names like
+      # "Foo <bar@x.com>" from being swallowed as HTML tags.
+      esc_from = html.escape(orig_from)
+      esc_date = html.escape(orig_date)
+      esc_subject = html.escape(orig_subject)
+      esc_to = html.escape(orig_to)
+      esc_cc = html.escape(orig_cc) if orig_cc else ""
       fwd_header_html = (
         '<div style="border-top:1px solid #ccc;margin-top:20px;padding-top:10px;color:#666;">'
         "<p><strong>---------- Forwarded message ----------</strong></p>"
-        f"<p>From: {orig_from}<br>"
-        f"Date: {orig_date}<br>"
-        f"Subject: {orig_subject}<br>"
-        f"To: {orig_to}"
+        f"<p>From: {esc_from}<br>"
+        f"Date: {esc_date}<br>"
+        f"Subject: {esc_subject}<br>"
+        f"To: {esc_to}"
       )
-      if orig_cc:
-        fwd_header_html += f"<br>Cc: {orig_cc}"
+      if esc_cc:
+        fwd_header_html += f"<br>Cc: {esc_cc}"
       fwd_header_html += "</p></div>"
-      quoted_html = orig_html if orig_html else (f"<pre>{orig_plain}</pre>" if orig_plain else "")
+      # orig_html is already HTML (from sender), trust as-is; for plain text
+      # fallback wrap in <pre> with escaped content to prevent injection.
+      quoted_html = orig_html if orig_html else (f"<pre>{html.escape(orig_plain)}</pre>" if orig_plain else "")
       body = f"{body}<br><br>{fwd_header_html}{quoted_html}"
     else:
       quoted_plain = orig_plain or ""
